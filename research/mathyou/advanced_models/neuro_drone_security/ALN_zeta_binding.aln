@@ -1,0 +1,62 @@
+// ALN_zeta_binding.aln
+// Binds NeuroSDR firewall to ALN execution pipeline with mandatory checks and safe fallbacks
+
+[ALN_BINDING_META]
+DEFINE FIREWALL_PROFILE = "NeuroSDR_Validation.v3"
+DEFINE FIREWALL_FILE = "NeuroSDR_Compliance_Firewall.zeta"
+DEFINE ENFORCEMENT_MODE = "Mandatory"
+DEFINE FALLBACK_MODE = "DetectOnly"
+
+[ALN_PRELOAD]
+LOAD_ZETA_PROFILE(FIREWALL_FILE, FIREWALL_PROFILE)
+ASSERT PROFILE_SIGNATURE_VALID(FIREWALL_PROFILE) // cryptographic verification required
+SET DEFAULT_DECISION = "DENY"
+
+[ALN_PIPELINE_INTERCEPTORS]
+INTERCEPT BEFORE EXEC_CMD:
+  // Normalize request and present to firewall
+  Context.Signal.Frequency     = Ccmd.ωjam
+  Context.Signal.Power_Watts   = Ccmd.Pjam
+  Context.Signal.Dwell_ms      = Ccmd.Dwell_ms
+  Context.Signal.HopRate_Hz    = Ccmd.HopRate
+  Context.Signal.WaveformClass = Ccmd.WaveformClass
+  Context.Attestation          = NODE.ATTEST()
+  Context.Location             = GEO.CURRENT()
+  Context.Now                  = CLOCK.UTC()
+  Context.Measurements         = SDR.MEASURE_PRETX()
+
+  DECISION = ZETA.EVAL(FIREWALL_PROFILE, Context)
+  IF DECISION == "ALLOW":
+      CONTINUE
+  ELSE:
+      SET SYSTEM.MODE = FALLBACK_MODE
+      LOG_EVENT("CMD_BLOCKED_BY_FIREWALL", {Reason: ZETA.REASON(), Context})
+      ABORT EXEC_CMD
+  END_IF
+
+INTERCEPT AFTER EXEC_CMD:
+  MEAS = SDR.MEASURE_POSTTX()
+  ZETA.REPORT_METRICS(FIREWALL_PROFILE, MEAS)
+  LEDGER.APPEND_SEALED("TX_EXECUTED", HASH(MEAS))
+
+[ALN_KEY_MGMT]
+CRON PQC_REKEY(interval_s = Policy.RekeyInterval_s):
+  PQC.REKEY()
+  LEDGER.APPEND_SEALED("PQC_REKEY", TIMESTAMP())
+
+[ALN_POLICY_SYNC]
+CRON POLICY_PULL(interval_min = 30):
+  PKG = GOV_REPO.FETCH("neuro_sdr_policy_bundle.v3.tar")
+  IF VERIFY_SIGNATURE(PKG) AND HASH(PKG) ∈ LEDGER.AllowedHashes:
+      APPLY_POLICY(PKG)
+      ZETA.RELOAD_PROFILE(FIREWALL_PROFILE)
+      LEDGER.APPEND_SEALED("POLICY_UPDATED", HASH(PKG))
+  ELSE:
+      LOG_EVENT("POLICY_REJECTED", {reason: "verification_failed"})
+
+[ALN_FAILSAFE]
+EVENT SENSOR_CONFLICT or PQ_LEAK or GEO_FENCE_BREACH:
+  SET SYSTEM.MODE = FALLBACK_MODE
+  DISABLE SDR.TX
+  ENABLE DETECT_ONLY + AR/VR_ALERTS(Level = "High")
+  LEDGER.APPEND_SEALED("FAILSAFE_ENGAGED", {Event, Timestamp: NOW()})
