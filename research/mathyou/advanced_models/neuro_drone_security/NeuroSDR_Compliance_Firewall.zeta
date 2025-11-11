@@ -1,0 +1,130 @@
+// NeuroSDR_Compliance_Firewall.zeta
+// Functional SDR-spectrum compliance firewall for ALN Drone Defense
+// Scope: Non-hypothetical enforcement of jamming safety, spectrum integrity, and node attestation
+
+PROFILE "NeuroSDR_Validation.v3" {
+
+  SECTION SpectrumPolicy {
+    // Legal band masks must reflect jurisdictional rules configured out-of-band.
+    Import ProtectedBands from "governance/bands/protected_bands.v1.json" // immutable set
+    Import AllowedBands   from "governance/bands/allowed_bands.v1.json"   // jurisdictional superset
+    Import PowerLimits    from "governance/power/max_erp_limits.v1.json"  // per-band ERP caps (W)
+    Import DwellLimits    from "governance/dwell/max_dwell_ms.v1.json"    // per-band dwell caps (ms)
+
+    Rule Guard_ProtectedBands:
+      Deny If Signal.Frequency ∈ ProtectedBands
+
+    Rule Allow_Only_ApprovedBands:
+      Deny If Signal.Frequency ∉ AllowedBands
+
+    Rule Enforce_Power_By_Band:
+      Deny If Signal.Power_Watts > PowerLimits[Signal.FrequencyBand]
+
+    Rule Enforce_Dwell_Time:
+      Deny If Signal.Dwell_ms > DwellLimits[Signal.FrequencyBand]
+
+    Rule Constrain_OOB_Emissions:
+      Require Measure(ACLR_dB) ≥ 45
+      Require Measure(SpectralMask_MeetsITU) == TRUE
+
+    Rule Hop_Rate_Control:
+      // Prevent aggressive sweeping that could create harmful interference
+      Require Signal.HopRate_Hz ≤ Policy.MaxHopRate_Hz
+  }
+
+  SECTION SignatureNormalization {
+    // Normalize and certify waveform footprint to reduce collateral interference
+    Import NormalizationTargets from "governance/spectral/normalization_targets.v2.json"
+    Import PSD_RefCurves        from "governance/spectral/psd_ref_curves.v2.json"
+
+    Transform Normalize_Waveform:
+      // Apply shaping to meet normalized PSD and mask
+      Apply Window = Policy.PSD_Window // e.g., Kaiser β configured by policy
+      Apply CrestFactorReduction(Target_dB = NormalizationTargets.CFR_dB)
+      Apply PreDistortion(LinearizedPA = TRUE)
+
+    Validate PSD_Match:
+      Require Delta(Measure.PSD, PSD_RefCurves[Signal.WaveformClass]) ≤ Policy.PSD_Delta_dB
+
+    Validate EVM_Conformance:
+      Require Measure.EVM_Percent ≤ Policy.MaxEVM_Percent
+  }
+
+  SECTION NodeAttestation {
+    Import CA_Roots from "governance/attestation/roots.v1.pem"
+    Import PQC_Schemes from "governance/crypto/pqc_schemes.v2.json" // e.g., Kyber, Dilithium
+
+    Rule Verify_Node_CertChain:
+      Require Attestation.Cert.Valid == TRUE
+      Require Attestation.Cert.ChainVerified(CA_Roots) == TRUE
+      Require Attestation.PQC.Algorithm ∈ PQC_Schemes.Approved
+
+    Rule Verify_Code_Signing:
+      Require Update.Package.SignatureVerified == TRUE
+      Require Update.Package.Repo == "Authorized"
+      Deny If Update.Package.Hash ∉ Ledger.AllowedHashes
+  }
+
+  SECTION OperationalSafety {
+    // Real-time interlocks to prevent unsafe activations
+    Import GeoFences from "governance/geofencing/geofences.v3.json" // polygons, altitude rules
+    Import TimeLocks from "governance/operations/timelocks.v1.json" // allowed windows
+
+    Rule GeoFence_Block:
+      Deny If Location.Current ∈ GeoFences.NoEmitZones
+
+    Rule Time_Window_Allow:
+      Deny If Now.UTC ∉ TimeLocks.AllowedWindows
+
+    Rule HumanOverride_SafeHold:
+      Require HMI.Consent == TRUE For Mode.ActiveJam
+      On Missing HMI.Consent:
+        Enforce FailSafe(State = "DetectOnly", Logging = "Verbose")
+
+    Rule Airspace_Sensor_Coordination:
+      Require ADSB.Conflict == FALSE
+      Require Radar.FriendlyTrackSeparation_m ≥ Policy.MinSeparationMeters
+  }
+
+  SECTION QuantumLeakageMon {
+    // Monitor side-channel and post-quantum failures
+    Rule PQ_Leakage_Thresholds:
+      Require Measure.SideChannelLeakage ≤ Policy.QL_MaxLeakScore
+      On Breach:
+        Enforce FailSafe(State = "Idle", Alert = "PQLeak")
+
+    Rule PQ_KeyHealth:
+      Require PQC.Session.KeyAge ≤ Policy.MaxKeyAge_s
+      Require PQC.Session.RekeyInterval_s ≤ Policy.RekeyInterval_s
+  }
+
+  SECTION AuditAndTelemetry {
+    // Immutable audit trails with privacy-preserving summaries
+    Export Audit.Log to "ledger/audit/NeuroSDR_v3.log" Mode="append+sign"
+    Export Metrics.Stream to "telemetry/metrics/rt.jsonl" Fields={
+      Timestamp, NodeID, Decision, Frequency, Power_W, Dwell_ms, ACLR_dB, EVM_Percent
+    }
+
+    Rule Log_On_Every_Decision:
+      Log {DecisionContext}
+
+    Rule Redact_PII:
+      Require Anonymize(OperatorID)
+      Require Hash(NodeHardwareID, Salt = Ledger.RollingSalt)
+  }
+
+  SECTION Enforcement {
+    // Bind all allows through explicit pass; default deny
+    DefaultPolicy = "DENY"
+
+    Allow If All {
+      SpectrumPolicy.Pass,
+      SignatureNormalization.Pass,
+      NodeAttestation.Pass,
+      OperationalSafety.Pass,
+      QuantumLeakageMon.Pass
+    } Else {
+      Deny
+    }
+  }
+}
